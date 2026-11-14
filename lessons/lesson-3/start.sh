@@ -815,7 +815,8 @@ for n in names:
         shop.fail(f"fulfillment instance {n} is not answering on {shop.instance_url(n)}")
 if not shop.healthy(shop.ORDERS_URL):
     shop.fail("order-service is not answering")
-time.sleep(2)
+# The group may still be settling (start-up, or right after the demo restarted it).
+shop.wait_stable(names, timeout=90)
 _, per = shop.group_stats(names)
 owned = [p for n in names for p in per[n]["ownedPartitions"]]
 print(f"[VERIFY] partitions owned: " + ", ".join(f"{n}={per[n]['ownedPartitions']}" for n in names))
