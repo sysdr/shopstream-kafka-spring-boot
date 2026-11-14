@@ -12,6 +12,7 @@ cd "$ROOT"
 KAFKA_VERSION="3.9.1"
 KAFKA_HOME="${KAFKA_HOME:-$HOME/.cache/shopstream/kafka_2.13-$KAFKA_VERSION}"
 BROKERS=1
+export ORDERS_REPLICAS=$(( BROKERS >= 3 ? 3 : 1 ))
 export KAFKA_HOME ORDERS_PORT="${ORDERS_PORT:-8081}" FULFILLMENT_PORT="${FULFILLMENT_PORT:-8082}"
 export KAFKA_BOOTSTRAP="localhost:19092$( [ "$BROKERS" -gt 1 ] && echo ',localhost:29092,localhost:39092' || true )"
 
@@ -69,8 +70,13 @@ group.initial.rebalance.delay.ms=0
 auto.create.topics.enable=false
 PROPS
   "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$CLUSTER_ID" -c "$D/server.properties" >/dev/null
-  LOG_DIR="$D/logs" KAFKA_HEAP_OPTS="-Xmx512m -Xms256m" nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$D/server.properties" > "$D/logs/console.log" 2>&1 &
-  echo $! > "$RUN/kafka-$i.pid"
+  # start-broker.sh restarts this broker after a failure drill (the demo uses it).
+  cat > "$D/start-broker.sh" <<BROKER
+#!/usr/bin/env bash
+LOG_DIR="$D/logs" KAFKA_HEAP_OPTS="-Xmx512m -Xms256m" nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$D/server.properties" >> "$D/logs/console.log" 2>&1 &
+echo \$! > "$RUN/kafka-$i.pid"
+BROKER
+  bash "$D/start-broker.sh"
 done
 for _ in $(seq 1 60); do
   if "$KAFKA_HOME/bin/kafka-broker-api-versions.sh" --bootstrap-server "$KAFKA_BOOTSTRAP" >/dev/null 2>&1; then break; fi
@@ -504,6 +510,7 @@ public class OrderTracker {
     private final Map<String, Integer> lastSeq = new HashMap<>();
     private final Map<String, Set<Integer>> partitionsByOrder = new HashMap<>();
     private final Map<Integer, Integer> eventsByPartition = new TreeMap<>();
+    private final Set<String> disordered = new HashSet<>();
     private int received;
     private int outOfOrder;
     private int completed;
@@ -517,9 +524,10 @@ public class OrderTracker {
         boolean inOrder = e.seq() == last + 1;
         if (!inOrder) {
             outOfOrder++;
+            disordered.add(e.orderId());
         }
         lastSeq.put(e.orderId(), Math.max(last, e.seq()));
-        if (e.seq() == 3 && inOrder) {
+        if (e.seq() == 3 && inOrder && !disordered.contains(e.orderId())) {
             completed++;
         }
         return inOrder;
@@ -528,6 +536,7 @@ public class OrderTracker {
     public synchronized void reset() {
         lastSeq.clear();
         partitionsByOrder.clear();
+        disordered.clear();
         eventsByPartition.clear();
         received = 0;
         outOfOrder = 0;
