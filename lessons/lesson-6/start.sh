@@ -431,8 +431,10 @@ public class DeadLetterInspector {
         m.put("value", rec.value() == null ? null : rec.value().substring(0, Math.min(60, rec.value().length())));
         m.put("originalPartition", header(rec, KafkaHeaders.DLT_ORIGINAL_PARTITION, true));
         m.put("originalOffset", header(rec, KafkaHeaders.DLT_ORIGINAL_OFFSET, true));
+        String cause = (String) header(rec, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN, false);
+        m.put("cause", cause == null ? null : cause.substring(cause.lastIndexOf('.') + 1));
         String reason = (String) header(rec, KafkaHeaders.DLT_EXCEPTION_MESSAGE, false);
-        m.put("reason", reason == null ? null : reason.substring(0, Math.min(120, reason.length())));
+        m.put("reason", reason == null ? null : reason.substring(0, Math.min(200, reason.length())));
         recent.addFirst(m);
         while (recent.size() > 10) {
             recent.removeLast();
@@ -1833,7 +1835,7 @@ d = shop.dlt()
 print(f"   good orders processed {good}/300   dead letters {d['deadLetters'] - d0}   consumer lag {shop.lag_total()}")
 if d["recent"]:
     r = d["recent"][0]
-    print(f"   e.g. key={r['key']} from partition {r['originalPartition']} offset {r['originalOffset']}: {r['reason']}")
+    print(f"   e.g. key={r['key']} from partition {r['originalPartition']} offset {r['originalOffset']}: {r['cause']}")
 
 print("\n3) Lag alert: fulfillment stops while orders keep coming (threshold 500, for 5 s)")
 shop.stop_service("f1")

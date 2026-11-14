@@ -1,0 +1,6 @@
+target/
+.run/
+__pycache__/
+*.pyc
+lessons/*/shopstream-events/
+lessons/*/verify.sh
