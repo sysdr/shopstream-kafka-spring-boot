@@ -14,7 +14,7 @@ KAFKA_HOME="${KAFKA_HOME:-$HOME/.cache/shopstream/kafka_2.13-$KAFKA_VERSION}"
 BROKERS=1
 export ORDERS_REPLICAS=$(( BROKERS >= 3 ? 3 : 1 ))
 export KAFKA_HOME ORDERS_PORT="${ORDERS_PORT:-8081}" FULFILLMENT_PORT="${FULFILLMENT_PORT:-8082}"
-export KAFKA_BOOTSTRAP="localhost:19092$( [ "$BROKERS" -gt 1 ] && echo ',localhost:29092,localhost:39092' || true )"
+export KAFKA_BOOTSTRAP="localhost:19092$( [ "$BROKERS" -gt 1 ] && echo ',localhost:19192,localhost:19292' || true )"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 need() { command -v "$1" >/dev/null || { echo "[ERROR] $1 not found. $2"; exit 1; }; }
@@ -43,9 +43,11 @@ fi
 echo "[INFO] Kafka at $KAFKA_HOME"
 
 mkdir -p "$RUN"
-rm -rf "$RUN"/kafka-*   # fresh cluster every run: the demo numbers start from zero
+rm -rf "$RUN"/kafka-* "$RUN"/orders-db*   # fresh cluster and database every run: the demo numbers start from zero
 VOTERS=""
-for i in $(seq 1 "$BROKERS"); do VOTERS="$VOTERS${VOTERS:+,}$i@localhost:${i}9093"; done
+# ports stay below 32768 (the ephemeral range), or an outgoing connection can steal one
+port() { echo $(( 19092 + ($1 - 1) * 100 + $2 )); }
+for i in $(seq 1 "$BROKERS"); do VOTERS="$VOTERS${VOTERS:+,}$i@localhost:$(port $i 1)"; done
 CLUSTER_ID="$("$KAFKA_HOME/bin/kafka-storage.sh" random-uuid)"
 RF=$(( BROKERS >= 3 ? 3 : 1 )); MINISR=$(( BROKERS >= 3 ? 2 : 1 ))
 for i in $(seq 1 "$BROKERS"); do
@@ -54,8 +56,8 @@ for i in $(seq 1 "$BROKERS"); do
 process.roles=broker,controller
 node.id=$i
 controller.quorum.voters=$VOTERS
-listeners=PLAINTEXT://localhost:${i}9092,CONTROLLER://localhost:${i}9093
-advertised.listeners=PLAINTEXT://localhost:${i}9092
+listeners=PLAINTEXT://localhost:$(port $i 0),CONTROLLER://localhost:$(port $i 1)
+advertised.listeners=PLAINTEXT://localhost:$(port $i 0)
 controller.listener.names=CONTROLLER
 inter.broker.listener.name=PLAINTEXT
 listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
@@ -860,35 +862,38 @@ def drain(names, orders, label, window=60):
     return {"drain_s": done_at, "peak_lag": peak, "rebalances": reb, "dup": dup}
 
 
-print("1) One consumer (f1) owns all 6 partitions; 200 orders, 5 ms of work per event")
+print("1) One consumer (f1) owns all 6 partitions; 300 orders, 10 ms of work per event")
 shop.stop_fulfillment(["f2", "f3"])
-time.sleep(3)
-one = drain(["f1"], 200, "1 consumer ")
+shop.wait_stable(["f1"])
+one = drain(["f1"], 300, "1 consumer ")
 
 print("\n2) Scale out: start f2 and f3 in the same group")
-shop.start_fulfillment(["f2", "f3"], ["--app.process-delay-ms=5"])
-time.sleep(4)
-three = drain(ALL, 200, "3 consumers")
+shop.start_fulfillment(["f2", "f3"], ["--app.process-delay-ms=10"])
+shop.wait_stable(ALL)
+three = drain(ALL, 300, "3 consumers")
 
 print("\n3) Break it: 100 ms of work per event, max.poll.records=100, max.poll.interval.ms=5000")
 print("   (a batch takes 10 s, longer than the 5 s the broker waits for the next poll)")
 shop.stop_fulfillment()
 slow = ["--app.process-delay-ms=100", "--spring.kafka.consumer.max-poll-records=100",
         "--spring.kafka.consumer.properties.max.poll.interval.ms=5000"]
+shop.skip_backlog()
 shop.start_fulfillment(ALL, slow)
-time.sleep(4)
+shop.wait_stable(ALL)
 storm = drain(ALL, 100, "storm      ", window=45)
 
 print("\n4) Fix it: same work, max.poll.records=10 (one batch = 1 s, well inside 5 s)")
 shop.stop_fulfillment()
 fixed = slow[:1] + ["--spring.kafka.consumer.max-poll-records=10", slow[2]]
+shop.skip_backlog()
 shop.start_fulfillment(ALL, fixed)
-time.sleep(4)
+shop.wait_stable(ALL)
 calm = drain(ALL, 100, "fixed      ", window=45)
 
 print("\nRestoring the normal configuration ...")
 shop.stop_fulfillment()
-shop.start_fulfillment(ALL, ["--app.process-delay-ms=5"])
+shop.skip_backlog()
+shop.start_fulfillment(ALL, ["--app.process-delay-ms=10"])
 print(f"\nScaling 1 -> 3 consumers: drain {one['drain_s']:.1f} s -> {three['drain_s']:.1f} s. "
       f"Storm: {storm['rebalances']} rebalances, {storm['dup']} events processed twice; fixed: {calm['rebalances']} and {calm['dup']}.")
 SHOPSTREAM_EOF
@@ -956,7 +961,7 @@ def start_service(name, profile, port, extra=()):
     log = open(RUN / f"{name}.log", "ab")
     cmd = ["java", "-Xmx256m", "-jar", str(PROJECT / "target/shopstream-events.jar"),
            f"--spring.profiles.active={profile}", f"--server.port={port}", *extra]
-    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, cwd=PROJECT)
     (RUN / f"{name}.pid").write_text(str(p.pid))
     return p.pid
 
@@ -1034,6 +1039,31 @@ def reset_group(names):
 
 def lag(names):
     return call("GET", instance_url(names[0]) + "/lag")
+
+
+def wait_stable(names, timeout=60):
+    """Wait until the group has settled: every instance owns partitions, together exactly 0-5, no rebalance for 2 s."""
+    end, last, since = time.time() + timeout, None, time.time()
+    while time.time() < end:
+        try:
+            per = {n: call("GET", instance_url(n) + "/stats") for n in names}
+        except Exception:
+            time.sleep(0.5)
+            continue
+        owned = sorted(p for n in names for p in per[n]["ownedPartitions"])
+        sig = (tuple(owned), sum(per[n]["rebalances"] for n in names))
+        if sig != last:
+            last, since = sig, time.time()
+        elif owned == list(range(6)) and all(per[n]["ownedPartitions"] for n in names) and time.time() - since >= 2:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def skip_backlog(group="fulfillment"):
+    """Move a stopped group's offsets to the end of the topic (discard what it has not read)."""
+    subprocess.run([str(KAFKA_HOME / "bin/kafka-consumer-groups.sh"), "--bootstrap-server", BOOTSTRAP, "--group", group,
+                    "--reset-offsets", "--to-latest", "--all-topics", "--execute"], capture_output=True, timeout=60)
 SHOPSTREAM_EOF
 
 say "Build and unit tests (Maven)"
@@ -1047,7 +1077,7 @@ import sys
 sys.path.insert(0, "shopstream-events/tools")
 import shop
 shop.start_service("orders", "orders", shop.ORDERS_URL.rsplit(":", 1)[1])
-shop.start_fulfillment(["f1", "f2", "f3"], ["--app.process-delay-ms=5"])
+shop.start_fulfillment(["f1", "f2", "f3"], ["--app.process-delay-ms=10"])
 for url in [shop.ORDERS_URL] + [shop.instance_url(n) for n in shop.INSTANCES]:
     if not shop.wait_for(lambda: shop.healthy(url), timeout=90):
         print("[ERROR] service did not start:", url); print(open(shop.RUN / "fulfillment.log").read()[-2000:]); sys.exit(1)
