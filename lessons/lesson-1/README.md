@@ -46,7 +46,7 @@ Timings depend on your machine; the counts should look like this (sandbox run):
 
 ```text
 [VERIFY] both services healthy
-[VERIFY] 20 events published and consumed; p99 end-to-end 1598 ms
+[VERIFY] 20 events published and consumed; p99 end-to-end 77 ms
 PASS  Lesson 1 complete. Your completion code: SHOP2-PUBLISH-5R8K
   published 200 in 4.17 s (48 orders/s, each waits for the broker ack)
   fulfillment received 200  end-to-end p50 6 ms  p99 80 ms  max 83 ms
@@ -75,7 +75,7 @@ $HOME/.cache/shopstream/kafka_2.13-3.9.1/bin/kafka-consumer-groups.sh --bootstra
 bash verify.sh
 ```
 
-Checks both services are healthy, publishes 20 orders and waits until fulfillment has received all 20. On success it prints:
+Checks both services are healthy, sends one warm-up order (the first event also waits for the consumer to join its group), then publishes 20 orders and checks fulfillment received all 20 with p99 under 2 s. On success it prints:
 
 ```text
 PASS  Lesson 1 complete. Your completion code: SHOP2-PUBLISH-5R8K
