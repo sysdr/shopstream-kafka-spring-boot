@@ -430,6 +430,12 @@ if not shop.healthy(shop.FULFILL_URL):
     shop.fail("fulfillment-service is not answering on " + shop.FULFILL_URL)
 print("[VERIFY] both services healthy")
 
+# Warm-up: the first event also waits for the consumer to join its group and get partitions.
+warm = shop.stats()["received"]
+shop.place_order(0)
+if not shop.wait_for(lambda: shop.stats()["received"] > warm, timeout=60):
+    shop.fail("fulfillment did not receive the warm-up event within 60 s")
+shop.call("POST", shop.FULFILL_URL + "/stats/reset")
 before = shop.stats()["received"]
 first = shop.place_order(1)
 if not first.get("orderId", "").startswith("ORD-") or "offset" not in first:
@@ -440,8 +446,8 @@ if not shop.wait_for(lambda: shop.stats()["received"] >= before + 20, timeout=20
     shop.fail(f"fulfillment received {shop.stats()['received'] - before} of 20 events")
 s = shop.stats()
 print(f"[VERIFY] 20 events published and consumed; p99 end-to-end {s['p99Ms']} ms")
-if s["p99Ms"] > 5000:
-    shop.fail("p99 end-to-end latency is over 5 s (first events include JVM warm-up)")
+if s["p99Ms"] > 2000:
+    shop.fail("p99 end-to-end latency is over 2 s")
 SHOPSTREAM_EOF
 mkdir -p "$PROJECT_DIR/tools"
 cat > "$PROJECT_DIR/tools/demo.py" <<'SHOPSTREAM_EOF'
