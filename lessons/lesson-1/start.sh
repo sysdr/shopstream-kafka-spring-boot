@@ -614,7 +614,7 @@ say "Verify"
 bash "$ROOT/verify.sh"
 
 say "Demo"
-python3 "$PROJECT_DIR/tools/demo.py"
+python3 -u "$PROJECT_DIR/tools/demo.py"
 
 say "Done"
 echo "order-service:       http://localhost:$ORDERS_PORT   (POST /orders)"

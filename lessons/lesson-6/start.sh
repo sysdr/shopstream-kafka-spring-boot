@@ -369,6 +369,7 @@ cat > "$PROJECT_DIR/src/main/java/com/shopstream/events/DeadLetterConfig.java" <
 package com.shopstream.events;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import org.apache.kafka.common.TopicPartition;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
@@ -388,7 +389,9 @@ import org.springframework.util.backoff.FixedBackOff;
 public class DeadLetterConfig {
     @Bean
     public CommonErrorHandler errorHandler(KafkaOperations<String, String> template) {
-        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template);
+        // Explicit destination: same partition number in orders.DLT (Spring's default name would be orders-dlt).
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template,
+                (rec, ex) -> new TopicPartition(Topics.ORDERS_DLT, rec.partition()));
         DefaultErrorHandler handler = new DefaultErrorHandler(recoverer, new FixedBackOff(200L, 2L));
         handler.addNotRetryableExceptions(JsonProcessingException.class);
         return handler;
@@ -788,7 +791,7 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.kafka.config.ContainerCustomizer;
 import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 
-/** Attaches the rebalance tracker to every listener container Spring Boot creates. */
+/** Attaches the rebalance tracker to the listener container that reads the orders topic. */
 @Configuration
 @Profile("fulfillment")
 public class ListenerConfig {
@@ -800,7 +803,12 @@ public class ListenerConfig {
     @Bean
     public ContainerCustomizer<Object, Object, ConcurrentMessageListenerContainer<Object, Object>> rebalanceCustomizer(
             RebalanceTracker tracker) {
-        return container -> container.getContainerProperties().setConsumerRebalanceListener(tracker);
+        return container -> {
+            String[] topics = container.getContainerProperties().getTopics();
+            if (topics != null && java.util.Arrays.asList(topics).contains(Topics.ORDERS)) {
+                container.getContainerProperties().setConsumerRebalanceListener(tracker);
+            }
+        };
     }
 }
 SHOPSTREAM_EOF
@@ -1442,7 +1450,8 @@ SHOPSTREAM_EOF
 mkdir -p "$PROJECT_DIR/src/main/resources"
 cat > "$PROJECT_DIR/src/main/resources/application-orders.properties" <<'SHOPSTREAM_EOF'
 # Day 5: order-service owns a database (H2, stored in a file so it survives a crash).
-spring.datasource.url=jdbc:h2:file:${APP_DB:./.run/orders-db};DB_CLOSE_ON_EXIT=FALSE
+# WRITE_DELAY=0: flush every commit to disk, so a crash right after COMMIT cannot undo it
+spring.datasource.url=jdbc:h2:file:${APP_DB:./.run/orders-db};DB_CLOSE_ON_EXIT=FALSE;WRITE_DELAY=0
 spring.datasource.username=sa
 spring.sql.init.mode=always
 SHOPSTREAM_EOF
@@ -2153,7 +2162,7 @@ say "Verify"
 bash "$ROOT/verify.sh"
 
 say "Demo"
-python3 "$PROJECT_DIR/tools/demo.py"
+python3 -u "$PROJECT_DIR/tools/demo.py"
 
 say "Done"
 echo "order-service:       http://localhost:$ORDERS_PORT   (POST /orders)"

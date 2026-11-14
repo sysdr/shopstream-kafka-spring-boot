@@ -595,7 +595,7 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.kafka.config.ContainerCustomizer;
 import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 
-/** Attaches the rebalance tracker to every listener container Spring Boot creates. */
+/** Attaches the rebalance tracker to the listener container that reads the orders topic. */
 @Configuration
 @Profile("fulfillment")
 public class ListenerConfig {
@@ -607,7 +607,12 @@ public class ListenerConfig {
     @Bean
     public ContainerCustomizer<Object, Object, ConcurrentMessageListenerContainer<Object, Object>> rebalanceCustomizer(
             RebalanceTracker tracker) {
-        return container -> container.getContainerProperties().setConsumerRebalanceListener(tracker);
+        return container -> {
+            String[] topics = container.getContainerProperties().getTopics();
+            if (topics != null && java.util.Arrays.asList(topics).contains(Topics.ORDERS)) {
+                container.getContainerProperties().setConsumerRebalanceListener(tracker);
+            }
+        };
     }
 }
 SHOPSTREAM_EOF
@@ -1182,7 +1187,8 @@ SHOPSTREAM_EOF
 mkdir -p "$PROJECT_DIR/src/main/resources"
 cat > "$PROJECT_DIR/src/main/resources/application-orders.properties" <<'SHOPSTREAM_EOF'
 # Day 5: order-service owns a database (H2, stored in a file so it survives a crash).
-spring.datasource.url=jdbc:h2:file:${APP_DB:./.run/orders-db};DB_CLOSE_ON_EXIT=FALSE
+# WRITE_DELAY=0: flush every commit to disk, so a crash right after COMMIT cannot undo it
+spring.datasource.url=jdbc:h2:file:${APP_DB:./.run/orders-db};DB_CLOSE_ON_EXIT=FALSE;WRITE_DELAY=0
 spring.datasource.username=sa
 spring.sql.init.mode=always
 SHOPSTREAM_EOF
@@ -1517,34 +1523,39 @@ import shop
 N, CRASH_EVERY = 300, 100
 
 
-def compare(prefix):
-    in_db = set(shop.db_ids(prefix))
+def compare(prefix, before_ids, before_dups):
+    in_db = set(shop.db_ids(prefix)) - before_ids
     shop.settle(prefix, quiet=3)
     got = shop.consumed(prefix, ids=True)
-    missing = in_db - set(got["ids"])
-    ghosts = set(got["ids"]) - in_db
-    return in_db, got, missing, ghosts
+    delivered = set(got["ids"]) - before_ids
+    return in_db, delivered, in_db - delivered, got["duplicates"] - before_dups
 
 
-print(f"1) Dual write: {N} orders, order-service crashes every {CRASH_EVERY}th order right after its commit")
+def baseline(prefix):
+    return set(shop.db_ids(prefix)), shop.consumed(prefix)["duplicates"]
+
+
+print(f"1) Dual write: {N} orders, order-service crashes on every {CRASH_EVERY}th order, right after its COMMIT")
 shop.restart_orders([f"--app.crash.every-n={CRASH_EVERY}"])
+before, dups = baseline("DUAL")
 crashes = 0
-while len(shop.db_ids("DUAL")) < N:
-    left = N - len(shop.db_ids("DUAL"))
+while len(set(shop.db_ids("DUAL")) - before) < N:
+    left = N - len(set(shop.db_ids("DUAL")) - before)
     try:
         shop.call("POST", shop.ORDERS_URL + "/orders/batch", {"mode": "dual", "count": left}, timeout=120)
     except Exception:
         crashes += 1
-        print(f"   order-service died after {len(shop.db_ids('DUAL')) if shop.orders_alive() else '?'} orders; restarting")
         shop.restart_orders([f"--app.crash.every-n={CRASH_EVERY}"])
+        print(f"   crash {crashes}: order-service died; {len(set(shop.db_ids('DUAL')) - before)} orders committed so far")
 if not shop.orders_alive():
     shop.restart_orders()
-in_db, got, missing, ghosts = compare("DUAL")
-print(f"   crashes {crashes}   orders in the database {len(in_db)}   OrderPlaced events delivered {got['unique']}")
-print(f"   MISMATCHED: {len(missing)} orders exist but no event was ever published -> {sorted(missing)}")
+in_db, delivered, missing, _ = compare("DUAL", before, dups)
+print(f"   orders in the database {len(in_db)}   OrderPlaced events delivered {len(delivered)}")
+print(f"   MISMATCHED: {len(missing)} orders were saved but never announced -> {sorted(missing)}")
 
-print(f"\n2) Outbox: {N} orders, the relay crashes every {CRASH_EVERY}th publish (after send, before marking it sent)")
+print(f"\n2) Outbox: {N} orders, the relay crashes on every {CRASH_EVERY}th publish (after send, before marking it sent)")
 shop.restart_orders([f"--app.crash.every-n={CRASH_EVERY}"])
+before, dups = baseline("OBX")
 try:
     shop.call("POST", shop.ORDERS_URL + "/orders/batch", {"mode": "outbox", "count": N}, timeout=120)
 except Exception:
@@ -1558,9 +1569,9 @@ while time.time() - t0 < 120:
     if shop.outbox()["PENDING"] == 0:
         break
     time.sleep(0.5)
-in_db, got, missing, ghosts = compare("OBX")
-print(f"   relay crashes {crashes}   orders in the database {len(in_db)}   distinct orders delivered {got['unique']}")
-print(f"   MISMATCHED: {len(missing)}   re-delivered after a crash: {got['duplicates']} "
+in_db, delivered, missing, redelivered = compare("OBX", before, dups)
+print(f"   relay crashes {crashes}   orders in the database {len(in_db)}   distinct orders delivered {len(delivered)}")
+print(f"   MISMATCHED: {len(missing)}   delivered twice after a crash: {redelivered} "
       f"(the consumer de-duplicates by order id, so each order is fulfilled once)")
 
 print("\nRestoring order-service without crashes ...")
@@ -1827,7 +1838,7 @@ say "Verify"
 bash "$ROOT/verify.sh"
 
 say "Demo"
-python3 "$PROJECT_DIR/tools/demo.py"
+python3 -u "$PROJECT_DIR/tools/demo.py"
 
 say "Done"
 echo "order-service:       http://localhost:$ORDERS_PORT   (POST /orders)"

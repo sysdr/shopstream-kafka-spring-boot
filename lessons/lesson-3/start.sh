@@ -368,7 +368,7 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.kafka.config.ContainerCustomizer;
 import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 
-/** Attaches the rebalance tracker to every listener container Spring Boot creates. */
+/** Attaches the rebalance tracker to the listener container that reads the orders topic. */
 @Configuration
 @Profile("fulfillment")
 public class ListenerConfig {
@@ -380,7 +380,12 @@ public class ListenerConfig {
     @Bean
     public ContainerCustomizer<Object, Object, ConcurrentMessageListenerContainer<Object, Object>> rebalanceCustomizer(
             RebalanceTracker tracker) {
-        return container -> container.getContainerProperties().setConsumerRebalanceListener(tracker);
+        return container -> {
+            String[] topics = container.getContainerProperties().getTopics();
+            if (topics != null && java.util.Arrays.asList(topics).contains(Topics.ORDERS)) {
+                container.getContainerProperties().setConsumerRebalanceListener(tracker);
+            }
+        };
     }
 }
 SHOPSTREAM_EOF
@@ -1099,7 +1104,7 @@ say "Verify"
 bash "$ROOT/verify.sh"
 
 say "Demo"
-python3 "$PROJECT_DIR/tools/demo.py"
+python3 -u "$PROJECT_DIR/tools/demo.py"
 
 say "Done"
 echo "order-service:       http://localhost:$ORDERS_PORT   (POST /orders)"
